@@ -1,0 +1,56 @@
+Файл index.html:
+<html>
+<head>
+    <title>АГРОИНЖЕНЕР</title>
+</head>
+<body bgcolor=aqua text=black background=BACKGRND.GIF> 
+    <h1 align="center">Компания АГРОИНЖЕНЕР</h1>
+    <hr align="center" size="7" width="100%">
+    <center><img src="IMAGE002.gif" border="5" alt="рисунок" 
+        width="90" height="90"></center>
+    <big><i><p>Компания АГРОИНЖЕНЕР обеспечит вас сельскохозяйственной 
+    техникой на любой вкус. Спасибо за интерес к нашей компании. 
+    Надеемся, что Ваше внимание и время не потрачены зря.</p></i></big>
+    <font size="5" face="Arial" color="#800080"><p align="justify">
+    Мы всегда рады видеть Вас в магазинах фирмы и в числе посетителей нашего сайта. В 
+    наших магазинах Вы всегда найдете в большом ассортименте сель
+    скохозяйственную технику, комплектующие к ней и запасные части по 
+    вашему выбору. Наша компания является авторизированным дилером 
+    более 20 крупнейших мировых производителей агроинженерной техники.
+    </p></font>
+    <hr align="center" size="5" width="100%" color="#008080 noshade">
+    <p style="font-style:oblique; font-size:100%; text-align:center; 
+    font-weight:700; color:#ff1493;">Мы продаем только то, что</p>
+    <ol start="1" type="1">
+    <li>пользуется максимальным спросом;
+    <li>меньше всего ломается;
+    <li>доступно по цене самому широкому кругу пользователей;
+    <li>и всегда, хотя бы на 1 рубль, дешевле, чем у конкурентов.
+    </ol>
+</body>
+</html>
+
+Файл main.go:
+package main
+
+import (
+    "log"
+    "net/http"
+)
+
+func main() {
+    // Раздаём файлы из текущей директории (где лежит index.html)
+    fs := http.FileServer(http.Dir("."))
+    
+    // Регистрируем обработчик для всех путей
+    http.Handle("/", fs)
+
+    // Проверяем наличие сертификатов для HTTPS
+    log.Println("Сервер запущен на https://localhost:1234")
+    
+    // Используем ListenAndServeTLS для HTTPS
+    err := http.ListenAndServeTLS("localhost:1234", "localhost+2.pem", "localhost+2-key.pem", nil)
+    if err != nil {
+        log.Fatal("Ошибка запуска сервера: ", err)
+    }
+}
