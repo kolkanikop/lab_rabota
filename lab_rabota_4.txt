@@ -1,0 +1,107 @@
+Файл main.go:
+package main
+
+import (
+    "encoding/json"
+    "log"
+    "net/http"
+    "sync"
+)
+
+type Task struct {
+    ID   int    `json:"id"`
+    Text string `json:"text"`
+}
+
+var (
+    tasks  = []Task{{1, "Изучить Nginx"}, {2, "Написать сервер"}}
+    nextID = 3
+    mu     sync.Mutex
+)
+
+func main() {
+    // 1. GET /api/health
+    http.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+    })
+
+    // 2. GET /api/tasks
+    http.HandleFunc("/api/tasks", func(w http.ResponseWriter, r *http.Request) {
+        mu.Lock()
+        defer mu.Unlock()
+        if r.Method == http.MethodGet {
+            w.Header().Set("Content-Type", "application/json")
+            json.NewEncoder(w).Encode(tasks)
+            return
+        }
+        // 3. POST /api/tasks
+        if r.Method == http.MethodPost {
+            var newTask Task
+            if err := json.NewDecoder(r.Body).Decode(&newTask); err != nil {
+                http.Error(w, err.Error(), http.StatusBadRequest)
+                return
+            }
+            newTask.ID = nextID
+            nextID++
+            tasks = append(tasks, newTask)
+            w.Header().Set("Content-Type", "application/json")
+            w.WriteHeader(http.StatusCreated)
+            json.NewEncoder(w).Encode(newTask)
+        }
+    })
+
+    log.Println("Сервер запущен на 127.0.0.1:8080")
+    log.Fatal(http.ListenAndServe("127.0.0.1:8080", nil))
+}
+
+Файл index.html:
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Задачи</title>
+</head>
+<body>
+    <h1>Список задач</h1>
+    <ul id="task-list"></ul>
+    
+    <input type="text" id="task-input" placeholder="Новая задача">
+    <button onclick="addTask()">Добавить</button>
+
+    <script>
+        // Загрузка задач
+        async function loadTasks() {
+            const res = await fetch('/api/tasks');
+            const tasks = await res.json();
+            const list = document.getElementById('task-list');
+            list.innerHTML = '';
+            tasks.forEach(t => {
+                const li = document.createElement('li');
+                li.textContent = t.text;
+                list.appendChild(li);
+            });
+        }
+
+        // Добавление задачи
+        async function addTask() {
+            const input = document.getElementById('task-input');
+            const text = input.value.trim();
+            if (!text) return;
+
+            const res = await fetch('/api/tasks', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text: text })
+            });
+
+            if (res.ok) {
+                input.value = '';
+                loadTasks();
+            }
+        }
+
+        loadTasks();
+    </script>
+</body>
+</html>
