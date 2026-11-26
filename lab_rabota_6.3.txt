@@ -1,0 +1,558 @@
+Файл main.go:
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"math"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+type Task struct {
+	ID        int       `json:"id"`
+	Title     string    `json:"title"`
+	Completed bool      `json:"completed"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type PaginatedTasksResponse struct {
+	Items      []Task `json:"items"`
+	Page       int    `json:"page"`
+	Limit      int    `json:"limit"`
+	Total      int    `json:"total"`
+	TotalPages int    `json:"total_pages"`
+}
+
+type TaskStats struct {
+	Total             int `json:"total"`
+	Completed         int `json:"completed"`
+	Active            int `json:"active"`
+	CompletionPercent int `json:"completion_percent"`
+}
+
+type ErrorResponse struct {
+	Error string `json:"error"`
+}
+
+var db *pgxpool.Pool
+
+func main() {
+	var err error
+	connString := "postgres://postgres:19991512@localhost:5432/studentdb"
+	db, err = pgxpool.New(context.Background(), connString)
+	if err != nil {
+		log.Fatalf("Не удалось подключиться к БД: %v", err)
+	}
+	defer db.Close()
+
+	_, err = db.Exec(context.Background(), `
+		CREATE TABLE IF NOT EXISTS tasks (
+			id SERIAL PRIMARY KEY,
+			title VARCHAR(200) NOT NULL,
+			completed BOOLEAN NOT NULL DEFAULT FALSE,
+			created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+		)
+	`)
+	if err != nil {
+		log.Fatalf("Ошибка создания таблицы: %v", err)
+	}
+
+	http.HandleFunc("/api/tasks/stats", statsHandler)
+	http.HandleFunc("/api/tasks", tasksHandler)
+	http.HandleFunc("/api/tasks/", taskIDHandler)
+	http.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	})
+
+	log.Println("Сервер запущен на 127.0.0.1:8080")
+	log.Fatal(http.ListenAndServe("127.0.0.1:8080", nil))
+}
+
+func statsHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodGet {
+		sendError(w, http.StatusMethodNotAllowed, "Метод не поддерживается")
+		return
+	}
+
+	var total, completed int
+	err := db.QueryRow(context.Background(), `
+		SELECT COUNT(*), COUNT(*) FILTER (WHERE completed = true) FROM tasks
+	`).Scan(&total, &completed)
+	if err != nil {
+		sendError(w, http.StatusInternalServerError, "Ошибка получения статистики")
+		return
+	}
+
+	active := total - completed
+	percent := 0
+	if total > 0 {
+		percent = int(math.Round(float64(completed) * 100 / float64(total)))
+	}
+
+	json.NewEncoder(w).Encode(TaskStats{
+		Total:             total,
+		Completed:         completed,
+		Active:            active,
+		CompletionPercent: percent,
+	})
+}
+
+func tasksHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	switch r.Method {
+	case http.MethodGet:
+		q := strings.TrimSpace(r.URL.Query().Get("q"))
+		status := r.URL.Query().Get("status")
+		if status == "" {
+			status = "all"
+		}
+		if status != "all" && status != "active" && status != "completed" {
+			sendError(w, http.StatusBadRequest, "Недопустимое значение параметра status")
+			return
+		}
+
+		page := 1
+		if pageStr := r.URL.Query().Get("page"); pageStr != "" {
+			p, err := strconv.Atoi(pageStr)
+			if err != nil || p < 1 {
+				sendError(w, http.StatusBadRequest, "Параметр page должен быть целым числом от 1")
+				return
+			}
+			page = p
+		}
+
+		limit := 10
+		if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
+			l, err := strconv.Atoi(limitStr)
+			if err != nil || l < 1 || l > 50 {
+				sendError(w, http.StatusBadRequest, "Параметр limit должен быть целым числом от 1 до 50")
+				return
+			}
+			limit = l
+		}
+
+		var conditions []string
+		var args []interface{}
+		argIdx := 1
+
+		if q != "" {
+			conditions = append(conditions, fmt.Sprintf("title ILIKE $%d", argIdx))
+			args = append(args, "%"+q+"%")
+			argIdx++
+		}
+		if status == "active" {
+			conditions = append(conditions, "completed = false")
+		} else if status == "completed" {
+			conditions = append(conditions, "completed = true")
+		}
+
+		whereClause := ""
+		if len(conditions) > 0 {
+			whereClause = "WHERE " + strings.Join(conditions, " AND ")
+		}
+
+		var total int
+		countQuery := fmt.Sprintf("SELECT COUNT(*) FROM tasks %s", whereClause)
+		if err := db.QueryRow(context.Background(), countQuery, args...).Scan(&total); err != nil {
+			sendError(w, http.StatusInternalServerError, "Ошибка подсчёта задач")
+			return
+		}
+
+		totalPages := 0
+		if total > 0 {
+			totalPages = (total + limit - 1) / limit
+		}
+
+		offset := (page - 1) * limit
+		dataQuery := fmt.Sprintf(
+			"SELECT id, title, completed, created_at FROM tasks %s ORDER BY created_at DESC, id DESC LIMIT $%d OFFSET $%d",
+			whereClause, argIdx, argIdx+1,
+		)
+		dataArgs := append(args, limit, offset)
+
+		rows, err := db.Query(context.Background(), dataQuery, dataArgs...)
+		if err != nil {
+			sendError(w, http.StatusInternalServerError, "Ошибка чтения из БД")
+			return
+		}
+		defer rows.Close()
+
+		tasks := []Task{}
+		for rows.Next() {
+			var t Task
+			if err := rows.Scan(&t.ID, &t.Title, &t.Completed, &t.CreatedAt); err != nil {
+				sendError(w, http.StatusInternalServerError, "Ошибка сканирования данных")
+				return
+			}
+			tasks = append(tasks, t)
+		}
+
+		json.NewEncoder(w).Encode(PaginatedTasksResponse{
+			Items:      tasks,
+			Page:       page,
+			Limit:      limit,
+			Total:      total,
+			TotalPages: totalPages,
+		})
+
+	case http.MethodPost:
+		var newTask struct {
+			Title string `json:"title"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&newTask); err != nil {
+			sendError(w, http.StatusBadRequest, "Неверный формат JSON")
+			return
+		}
+		title := strings.TrimSpace(newTask.Title)
+		if len([]rune(title)) < 1 || len([]rune(title)) > 200 {
+			sendError(w, http.StatusBadRequest, "Название задачи должно содержать от 1 до 200 символов")
+			return
+		}
+		var createdTask Task
+		err := db.QueryRow(context.Background(),
+			"INSERT INTO tasks (title) VALUES ($1) RETURNING id, title, completed, created_at",
+			title).Scan(&createdTask.ID, &createdTask.Title, &createdTask.Completed, &createdTask.CreatedAt)
+		if err != nil {
+			sendError(w, http.StatusInternalServerError, "Ошибка добавления задачи")
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(createdTask)
+	}
+}
+
+func taskIDHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	id := strings.TrimPrefix(r.URL.Path, "/api/tasks/")
+	if id == "" {
+		sendError(w, http.StatusBadRequest, "ID задачи не указан")
+		return
+	}
+	switch r.Method {
+	case http.MethodPatch:
+		var updateData struct {
+			Title     *string `json:"title"`
+			Completed *bool   `json:"completed"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&updateData); err != nil {
+			sendError(w, http.StatusBadRequest, "Неверный формат JSON")
+			return
+		}
+		if updateData.Title != nil {
+			title := strings.TrimSpace(*updateData.Title)
+			if len([]rune(title)) < 1 || len([]rune(title)) > 200 {
+				sendError(w, http.StatusBadRequest, "Название задачи должно содержать от 1 до 200 символов")
+				return
+			}
+			_, err := db.Exec(context.Background(), "UPDATE tasks SET title = $1 WHERE id = $2", title, id)
+			if err != nil {
+				sendError(w, http.StatusInternalServerError, "Ошибка обновления")
+				return
+			}
+		}
+		if updateData.Completed != nil {
+			_, err := db.Exec(context.Background(), "UPDATE tasks SET completed = $1 WHERE id = $2", *updateData.Completed, id)
+			if err != nil {
+				sendError(w, http.StatusInternalServerError, "Ошибка обновления")
+				return
+			}
+		}
+		var exists bool
+		db.QueryRow(context.Background(), "SELECT EXISTS(SELECT 1 FROM tasks WHERE id = $1)", id).Scan(&exists)
+		if !exists {
+			sendError(w, http.StatusNotFound, "Задача не найдена")
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "updated"})
+
+	case http.MethodDelete:
+		commandTag, err := db.Exec(context.Background(), "DELETE FROM tasks WHERE id = $1", id)
+		if err != nil {
+			sendError(w, http.StatusInternalServerError, "Ошибка удаления")
+			return
+		}
+		if commandTag.RowsAffected() == 0 {
+			sendError(w, http.StatusNotFound, "Задача не найдена")
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func sendError(w http.ResponseWriter, status int, message string) {
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(ErrorResponse{Error: message})
+}
+
+========== Файл index.html =========================================================================================================================================================================
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Задачи</title>
+    <style>
+        body { font-family: sans-serif; max-width: 700px; margin: 20px auto; }
+        .stats-bar { background: #f4f6f8; padding: 10px 15px; border-radius: 6px; margin-bottom: 15px; display: flex; gap: 20px; }
+        .controls { margin-bottom: 15px; display: flex; gap: 8px; flex-wrap: wrap; }
+        .pagination { margin: 15px 0; display: flex; align-items: center; gap: 10px; }
+        .error { color: red; margin: 10px 0; }
+        .empty { color: #666; font-style: italic; margin: 15px 0; }
+        .completed { text-decoration: line-through; color: gray; }
+        li { margin: 10px 0; }
+        button { margin-left: 5px; cursor: pointer; }
+        button:disabled { cursor: not-allowed; opacity: 0.5; }
+    </style>
+</head>
+<body>
+    <h1>Список задач</h1>
+
+    <!-- Блок статистики -->
+    <div id="stats-bar" class="stats-bar">
+        <span>Всего: <strong id="stat-total">0</strong></span>
+        <span>Выполнено: <strong id="stat-completed">0</strong></span>
+        <span>Осталось: <strong id="stat-active">0</strong></span>
+        <span>Прогресс: <strong id="stat-percent">0</strong>%</span>
+    </div>
+
+    <!-- Поиск и фильтрация -->
+    <div class="controls">
+        <input type="text" id="search-input" placeholder="Поиск по названию...">
+        <select id="status-select">
+            <option value="all">Все</option>
+            <option value="active">Активные</option>
+            <option value="completed">Выполненные</option>
+        </select>
+        <button onclick="applyFilters()">Применить</button>
+    </div>
+
+    <div id="error-message" class="error"></div>
+    <ul id="task-list"></ul>
+    <div id="empty-message" class="empty" style="display: none;">Задачи не найдены</div>
+
+    <!-- Пагинация -->
+    <div class="pagination">
+        <button id="prev-btn" onclick="changePage(-1)">Назад</button>
+        <span id="page-info">Страница 1 из 1</span>
+        <button id="next-btn" onclick="changePage(1)">Вперёд</button>
+        <label>
+            На странице:
+            <select id="limit-select" onchange="changeLimit()">
+                <option value="5">5</option>
+                <option value="10" selected>10</option>
+                <option value="20">20</option>
+                <option value="50">50</option>
+            </select>
+        </label>
+    </div>
+
+    <!-- Добавление новой задачи -->
+    <div>
+        <input type="text" id="task-input" placeholder="Новая задача (1-200 символов)">
+        <button onclick="addTask()">Добавить</button>
+    </div>
+
+    <script>
+        const apiBase = '/api/tasks';
+        let currentPage = 1;
+        let currentLimit = 10;
+        let currentQuery = '';
+        let currentStatus = 'all';
+        let totalPages = 0;
+
+        function showError(msg) {
+            document.getElementById('error-message').textContent = msg;
+        }
+        function clearError() {
+            document.getElementById('error-message').textContent = '';
+        }
+
+        async function fetchStats() {
+            try {
+                const res = await fetch(`${apiBase}/stats`);
+                if (!res.ok) return;
+                const stats = await res.json();
+                document.getElementById('stat-total').textContent = stats.total;
+                document.getElementById('stat-completed').textContent = stats.completed;
+                document.getElementById('stat-active').textContent = stats.active;
+                document.getElementById('stat-percent').textContent = stats.completion_percent;
+            } catch (e) {
+                console.error('Ошибка загрузки статистики:', e);
+            }
+        }
+
+        async function fetchTasks() {
+            try {
+                const params = new URLSearchParams({
+                    q: currentQuery,
+                    status: currentStatus,
+                    page: currentPage,
+                    limit: currentLimit
+                });
+                const res = await fetch(`${apiBase}?${params.toString()}`);
+                if (!res.ok) {
+                    const err = await res.json();
+                    throw new Error(err.error || 'Ошибка загрузки');
+                }
+                const data = await res.json();
+
+                // Если текущая страница оказалась за пределами после удаления последней записи
+                if (data.items.length === 0 && data.total > 0 && currentPage > data.total_pages) {
+                    currentPage = data.total_pages;
+                    return fetchTasks();
+                }
+
+                totalPages = data.total_pages;
+                renderTasks(data.items);
+                updatePaginationUI(data.page, data.total_pages);
+            } catch (e) {
+                showError(e.message);
+            }
+        }
+
+        function renderTasks(tasks) {
+            const list = document.getElementById('task-list');
+            const emptyMsg = document.getElementById('empty-message');
+            list.innerHTML = '';
+
+            if (tasks.length === 0) {
+                emptyMsg.style.display = 'block';
+                return;
+            }
+            emptyMsg.style.display = 'none';
+
+            tasks.forEach(t => {
+                const li = document.createElement('li');
+
+                const checkbox = document.createElement('input');
+                checkbox.type = 'checkbox';
+                checkbox.checked = t.completed;
+                checkbox.onchange = () => toggleCompleted(t.id, checkbox.checked);
+
+                const span = document.createElement('span');
+                span.textContent = ' ' + t.title + ' ';
+                if (t.completed) span.classList.add('completed');
+
+                const editBtn = document.createElement('button');
+                editBtn.textContent = '✏️';
+                editBtn.onclick = () => editTask(t.id, t.title);
+
+                const delBtn = document.createElement('button');
+                delBtn.textContent = '🗑️';
+                delBtn.onclick = () => deleteTask(t.id);
+
+                li.appendChild(checkbox);
+                li.appendChild(span);
+                li.appendChild(editBtn);
+                li.appendChild(delBtn);
+                list.appendChild(li);
+            });
+        }
+
+        function updatePaginationUI(page, pages) {
+            const displayTotal = pages === 0 ? 1 : pages;
+            document.getElementById('page-info').textContent = `Страница ${page} из ${displayTotal}`;
+            document.getElementById('prev-btn').disabled = page <= 1;
+            document.getElementById('next-btn').disabled = page >= pages || pages === 0;
+        }
+
+        function applyFilters() {
+            clearError();
+            currentQuery = document.getElementById('search-input').value.trim();
+            currentStatus = document.getElementById('status-select').value;
+            currentPage = 1;
+            fetchTasks();
+        }
+
+        function changePage(delta) {
+            clearError();
+            const next = currentPage + delta;
+            if (next >= 1 && next <= totalPages) {
+                currentPage = next;
+                fetchTasks();
+            }
+        }
+
+        function changeLimit() {
+            clearError();
+            currentLimit = parseInt(document.getElementById('limit-select').value, 10);
+            currentPage = 1;
+            fetchTasks();
+        }
+
+        async function refreshAll() {
+            await Promise.all([fetchTasks(), fetchStats()]);
+        }
+
+        async function addTask() {
+            clearError();
+            const input = document.getElementById('task-input');
+            const title = input.value.trim();
+            if (!title) { showError('Введите название'); return; }
+            const res = await fetch(apiBase, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ title: title })
+            });
+            if (res.ok) {
+                input.value = '';
+                refreshAll();
+            } else {
+                const err = await res.json();
+                showError(err.error || 'Ошибка добавления');
+            }
+        }
+
+        async function toggleCompleted(id, completed) {
+            clearError();
+            const res = await fetch(`${apiBase}/${id}`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ completed: completed })
+            });
+            if (res.ok) refreshAll();
+            else {
+                const err = await res.json();
+                showError(err.error);
+            }
+        }
+
+        async function editTask(id, oldTitle) {
+            clearError();
+            const newTitle = prompt('Введите новое название:', oldTitle);
+            if (newTitle === null) return;
+            const trimmed = newTitle.trim();
+            if (!trimmed) { showError('Название не может быть пустым'); return; }
+            const res = await fetch(`${apiBase}/${id}`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ title: trimmed })
+            });
+            if (res.ok) refreshAll();
+            else {
+                const err = await res.json();
+                showError(err.error);
+            }
+        }
+
+        async function deleteTask(id) {
+            clearError();
+            if (!confirm('Удалить задачу?')) return;
+            const res = await fetch(`${apiBase}/${id}`, { method: 'DELETE' });
+            if (res.ok) refreshAll();
+            else if (res.status === 404) showError('Задача уже удалена');
+        }
+
+        // Инициализация при открытии
+        refreshAll();
+    </script>
+</body>
+</html>
